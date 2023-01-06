@@ -175,7 +175,7 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
             self.norm_out = nn.LayerNorm(inner_dim)
             self.out = nn.Linear(inner_dim, self.num_vector_embeds - 1)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, return_dict: bool = True):
+    def forward(self, hidden_states, encoder_hidden_states=None, encoder_attention_mask=None, timestep=None, return_dict: bool = True):
         """
         Args:
             hidden_states ( When discrete, `torch.LongTensor` of shape `(batch size, num latent pixels)`.
@@ -213,7 +213,8 @@ class Transformer2DModel(ModelMixin, ConfigMixin):
 
         # 2. Blocks
         for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, context=encoder_hidden_states, timestep=timestep)
+            hidden_states = block(hidden_states, context=encoder_hidden_states,
+                                  mask=encoder_attention_mask, timestep=timestep)
 
         # 3. Output
         if self.is_input_continuous:
@@ -472,14 +473,14 @@ class BasicTransformerBlock(nn.Module):
             self.attn1._use_memory_efficient_attention_xformers = use_memory_efficient_attention_xformers
             self.attn2._use_memory_efficient_attention_xformers = use_memory_efficient_attention_xformers
 
-    def forward(self, hidden_states, context=None, timestep=None):
+    def forward(self, hidden_states, context=None, mask=None, timestep=None):
         # 1. Self-Attention
         norm_hidden_states = (
             self.norm1(hidden_states, timestep) if self.use_ada_layer_norm else self.norm1(hidden_states)
         )
 
         if self.only_cross_attention:
-            hidden_states = self.attn1(norm_hidden_states, context) + hidden_states
+            hidden_states = self.attn1(norm_hidden_states, context, mask=mask) + hidden_states
         else:
             hidden_states = self.attn1(norm_hidden_states) + hidden_states
 
@@ -488,7 +489,7 @@ class BasicTransformerBlock(nn.Module):
             norm_hidden_states = (
                 self.norm2(hidden_states, timestep) if self.use_ada_layer_norm else self.norm2(hidden_states)
             )
-            hidden_states = self.attn2(norm_hidden_states, context=context) + hidden_states
+            hidden_states = self.attn2(norm_hidden_states, context=context, mask=mask) + hidden_states
 
         # 3. Feed-forward
         hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
@@ -581,13 +582,15 @@ class CrossAttention(nn.Module):
 
         # attention, what we cannot get enough of
         if self._use_memory_efficient_attention_xformers:
+            assert mask is None
             hidden_states = self._memory_efficient_attention_xformers(query, key, value)
             # Some versions of xformers return output in fp32, cast it back to the dtype of the input
             hidden_states = hidden_states.to(query.dtype)
         else:
             if self._slice_size is None or query.shape[0] // self._slice_size == 1:
-                hidden_states = self._attention(query, key, value)
+                hidden_states = self._attention(query, key, value, mask=mask)
             else:
+                assert mask is None
                 hidden_states = self._sliced_attention(query, key, value, sequence_length, dim)
 
         # linear proj
@@ -596,7 +599,7 @@ class CrossAttention(nn.Module):
         hidden_states = self.to_out[1](hidden_states)
         return hidden_states
 
-    def _attention(self, query, key, value):
+    def _attention(self, query, key, value, mask=None):
         if self.upcast_attention:
             query = query.float()
             key = key.float()
@@ -608,6 +611,9 @@ class CrossAttention(nn.Module):
             beta=0,
             alpha=self.scale,
         )
+        if mask is not None:
+            # we assumed the mask is either 0 or -inf
+            attention_scores += mask
         attention_probs = attention_scores.softmax(dim=-1)
 
         # cast back to the original dtype
