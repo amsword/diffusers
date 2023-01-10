@@ -613,7 +613,17 @@ class CrossAttention(nn.Module):
         )
         if mask is not None:
             # we assumed the mask is either 0 or -inf
-            attention_scores += mask
+            #ipdb> pp attention_scores.shape
+            #torch.Size([16, 4096, 17])
+            #ipdb> mask.shape
+            #torch.Size([2, 17])
+            origin_shape = attention_scores.shape
+            attention_scores = attention_scores.reshape(mask.shape[0],
+                                     attention_scores.shape[0] // mask.shape[0],
+                                     attention_scores.shape[1],
+                                     attention_scores.shape[2])
+            attention_scores += mask.unsqueeze(1).unsqueeze(1)
+            attention_scores = attention_scores.reshape(*origin_shape)
         attention_probs = attention_scores.softmax(dim=-1)
 
         # cast back to the original dtype
